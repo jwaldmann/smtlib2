@@ -605,6 +605,9 @@ parseGetModel b (L.List ((L.Symbol "model"):mdl)) = do
       withFunList (b { vars = Map.insert v (FunArg tp) (vars b) }) ls $
         \b' tps args -> f b' (tp ::: tps) ((UntypedVar v tp) ::: args)
     withFunList _ lsp _ = throwError $ "Invalid fun args: "++show lsp
+parseGetModel b (L.List mdl) =
+  -- Z3 (4.8.10) does not print "model" here, so we insert it
+  parseGetModel b (L.List ((L.Symbol "model"):mdl))
 parseGetModel _ lsp = throwError $ "Invalid model: "++show lsp
 
 renderApplyTactic :: Tactic -> L.Lisp
