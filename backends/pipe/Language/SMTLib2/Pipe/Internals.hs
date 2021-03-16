@@ -236,6 +236,13 @@ instance Backend SMTPipe where
     case runExcept $ parseGetModel b mdl of
       Right mdl' -> return (mdl',b)
       Left err -> error $ "smtlib2: Unknown get-model response: "++err
+  modelEvaluate mdl (PipeExpr expr@(Expr.Var v)) b = do
+    let go (VarAssignment u (PipeExpr (Expr.Const c)) : ass) =
+          case geq u v of
+            Just Refl -> do
+              return (c,b)
+            Nothing -> go ass
+    go $ assignments mdl
   simplify (PipeExpr expr) b = do
     putRequest b (L.List [L.Symbol "simplify"
                          ,exprToLisp (datatypes b) expr])
