@@ -769,7 +769,10 @@ lispToExprWith :: (GShow fun,GShow e,GetFunType fun,GetType e)
                    -> LispParse a)
                -> LispParse a
 lispToExprWith p hint (runExcept . lispToConstant -> Right (AnyValue val)) res
-  = res (Const val)
+  = case (hint,val) of
+      (Just (Sort RealRepr), IntValue i) ->
+        res (Const $ RealValue $ fromInteger i)
+      _ -> res (Const val)
 lispToExprWith p hint (L.Symbol sym) res
   = parseVar p hint sym (res . Expr.Var) (res . Expr.QVar) (res . Expr.FVar) (res . Expr.LVar) `catchError`
     (\_ -> do
