@@ -31,7 +31,9 @@ import Control.Monad.Except
 import Data.Traversable
 import qualified GHC.TypeLits as TL
 
-import System.Process
+import System.Process.Typed as SPT
+import System.Process  (interruptProcessGroupOf)
+import Control.Exception (onException)
 import System.IO
 import qualified Data.ByteString as BS hiding (reverse)
 import qualified Data.ByteString.Char8 as BS8
@@ -47,9 +49,7 @@ import Control.Monad.State
 
 data PipeDatatype = forall a. IsDatatype a => PipeDatatype (Proxy a)
 
-data SMTPipe = SMTPipe { channelIn :: Handle
-                       , channelOut :: Handle
-                       , processHandle :: Maybe ProcessHandle
+data SMTPipe = SMTPipe { processHandle :: Process Handle Handle ()
                        , names :: Map String Int
                        , vars :: Map T.Text RevVar
                        , datatypes :: TypeRegistry T.Text T.Text T.Text
@@ -204,7 +204,7 @@ instance Backend SMTPipe where
       _ -> error $ "smtlib2: Invalid response to query for unsatisfiable core: "++show resp
   checkSat tactic limits b = do
     putRequest b $ renderCheckSat tactic limits
-    res <- BS.hGetLine (channelOut b)
+    res <- BS.hGetLine (getStdout $ processHandle b)
     return (case res of
               "sat" -> Sat
               "sat\r" -> Sat
@@ -273,18 +273,17 @@ instance Backend SMTPipe where
     putRequest nb req
     return ((),nb)
   exit b = do
+    -- I think we EITHER send "exit" and wait for process to end
+    -- OR we kill it?
     putRequest b (L.List [L.Symbol "exit"])
-    hClose (channelIn b)
-    hClose (channelOut b)
-    case processHandle b of
-      Nothing -> return ()
-      Just ph -> do
-        terminateProcess ph
-        _ <- waitForProcess ph
-        return ()
+    let ph = processHandle b
+    -- SPT.stopProcess ph >> waitExitCode ph
+    -- interruptProcessGroupOf (unsafeProcessHandle ph)
+    hClose (getStdin ph)
+    hClose (getStdout ph)
     return ((),b)
   comment msg b = do
-    hPutStrLn (channelIn b) ("; "++msg)
+    hPutStrLn (getStdin $ processHandle b) ("; "++msg)
     return ((),b)
   builtIn name arg ret b = return (UntypedFun (T.pack name) arg ret,b)
   applyTactic t b = do
@@ -675,14 +674,14 @@ createPipe :: String -- ^ Path to the binary of the SMT solver
          -> [String] -- ^ Command line arguments to be passed to the SMT solver
          -> IO SMTPipe
 createPipe solver args = do
-  let cmd = (proc solver args) { std_in = CreatePipe
-                               , std_out = CreatePipe
-                               , std_err = Inherit
-                               , close_fds = False }
-  (Just hin,Just hout,_,handle) <- createProcess cmd
-  let p0 = SMTPipe { channelIn = hin
-                   , channelOut = hout
-                   , processHandle = Just handle
+  let cmd = setStdin SPT.createPipe
+          $ setStdout SPT.createPipe
+          $ setStderr inherit
+          $ setCloseFds False -- should not close stderr?
+          $ setCreateGroup True
+          $ proc solver args
+  handle <- startProcess cmd
+  let p0 = SMTPipe { processHandle = handle
                    , names = Map.empty
                    , vars = Map.empty
                    , datatypes = emptyTypeRegistry
@@ -696,6 +695,7 @@ createPipe solver args = do
       _ -> return p0
     _ -> return p0
 
+{-
 -- | Create a SMT pipe by giving the input and output handle.
 createPipeFromHandle :: Handle -- ^ Input handle
                      -> Handle -- ^ Output handle
@@ -708,6 +708,7 @@ createPipeFromHandle hin hout = do
                  , vars = Map.empty
                  , datatypes = emptyTypeRegistry
                  , interpolationMode = MathSATInterpolation }
+-}
 
 lispToExprUntyped :: SMTPipe -> L.Lisp
                   -> (forall (t::Type). Expr SMTPipe t -> LispParse a)
@@ -1726,28 +1727,39 @@ numToLisp n = if n>=0
               else L.List [L.Symbol "-"
                           ,L.Number $ L.I $ abs n]
 
+-- I THINK this will pull characters from the solver's output
+-- (that we will ignore) until it blocks.
+-- E.g., a solver may send newlines and comments (traces, timing)
+-- The problem is that the solver may be slow in sending a comment
+-- (temporarily blocking) so we assume it's done,
+-- and mistake a slow comment for an actual response.
 clearInput :: SMTPipe -> IO ()
 clearInput pipe = do
-  r <- hReady (channelOut pipe)
+  let stdout = getStdout $ processHandle pipe
+  r <- hReady stdout
   if r
     then (do
-             _ <- BS.hGetSome (channelOut pipe) 1024
+             _ <- BS.hGetSome stdout 1024
              clearInput pipe)
     else return ()
 
 putRequest :: SMTPipe -> L.Lisp -> IO ()
 putRequest pipe expr = do
-  clearInput pipe
-  toByteStringIO (BS.hPutStr $ channelIn pipe) (mappend (L.fromLispExpr expr) flush)
-  BS8.hPutStrLn (channelIn pipe) ""
-  hFlush (channelIn pipe)
+  clearInput pipe -- we pull the character stream until it blocks.
+  -- then we send the request. so we can be sure that the following characters
+  -- are indeed from the response to this request.
+  let stdin = getStdin $ processHandle pipe
+  toByteStringIO (BS.hPutStr stdin) (mappend (L.fromLispExpr expr) flush)
+  BS8.hPutStrLn stdin ""
+  hFlush stdin
 
 parseResponse :: SMTPipe -> IO L.Lisp
 parseResponse pipe = do
-  str <- BS.hGetLine (channelOut pipe)
+  let stdout = getStdout $ processHandle pipe  
+  str <- BS.hGetLine stdout
   let continue (Done _ r) = return r
       continue res@(Partial _) = do
-        line <- BS.hGetLine (channelOut pipe)
+        line <- BS.hGetLine stdout
         continue (feed (feed res line) (BS8.singleton '\n'))
       continue (Fail str' ctx msg) = error $ "Error parsing "++show str'++" response in "++show ctx++": "++msg
   continue $ parse L.lisp (BS8.snoc str '\n')
